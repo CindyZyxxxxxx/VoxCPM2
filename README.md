@@ -232,6 +232,23 @@ voxcpm clone \
 # Batch processing
 voxcpm batch --input examples/input.txt --output-dir outs
 
+# Optional post-generation timestamps with stable-ts
+pip install "voxcpm[timestamps]"
+voxcpm design \
+  --text "VoxCPM2 brings studio-quality multilingual speech synthesis." \
+  --output out.wav \
+  --timestamps \
+  --timestamp-level word \
+  --timestamp-language en
+
+# Character timestamps are best-effort and are derived from word alignment
+voxcpm design \
+  --text "欢迎使用 VoxCPM2。" \
+  --output out.wav \
+  --timestamps \
+  --timestamp-level char \
+  --timestamp-language zh
+
 # Help
 voxcpm --help
 ```

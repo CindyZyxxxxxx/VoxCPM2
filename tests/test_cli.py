@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -322,6 +323,140 @@ def test_batch_subcommand_applies_control(monkeypatch, tmp_path):
     ]
 
 
+def test_design_writes_timestamp_json_when_requested(monkeypatch, tmp_path):
+    dummy_model = DummyModel()
+    timestamp_calls = []
+
+    def fake_align_audio_file(**kwargs):
+        timestamp_calls.append(kwargs)
+        return {
+            "audio_path": kwargs["audio_path"],
+            "sample_rate": kwargs["sample_rate"],
+            "backend": kwargs["backend"],
+            "level": kwargs["level"],
+            "text": kwargs["text"],
+            "items": [{"text": "hello", "start": 0.0, "end": 0.5, "level": "word"}],
+            "warning": None,
+        }
+
+    monkeypatch.setattr(cli, "load_model", lambda args: dummy_model)
+    monkeypatch.setattr(cli, "align_audio_file", fake_align_audio_file)
+    patch_soundfile_write(monkeypatch)
+
+    output = tmp_path / "out.wav"
+    run_main(
+        monkeypatch,
+        [
+            "design",
+            "--text",
+            "hello",
+            "--output",
+            str(output),
+            "--timestamps",
+            "--timestamp-language",
+            "en",
+        ],
+    )
+
+    timestamp_path = tmp_path / "out.timestamps.json"
+    payload = json.loads(timestamp_path.read_text(encoding="utf-8"))
+    assert payload["audio_path"] == str(output)
+    assert payload["text"] == "hello"
+    assert payload["items"][0]["text"] == "hello"
+    assert timestamp_calls[0]["language"] == "en"
+    assert timestamp_calls[0]["level"] == "word"
+
+
+def test_timestamp_alignment_failure_warns_by_default(monkeypatch, tmp_path, capsys):
+    dummy_model = DummyModel()
+
+    def fake_align_audio_file(**kwargs):
+        raise RuntimeError("alignment failed")
+
+    monkeypatch.setattr(cli, "load_model", lambda args: dummy_model)
+    monkeypatch.setattr(cli, "align_audio_file", fake_align_audio_file)
+    patch_soundfile_write(monkeypatch)
+
+    run_main(
+        monkeypatch,
+        [
+            "design",
+            "--text",
+            "hello",
+            "--output",
+            str(tmp_path / "out.wav"),
+            "--timestamps",
+        ],
+    )
+
+    assert "Timestamp alignment failed" in capsys.readouterr().err
+
+
+def test_timestamp_alignment_failure_exits_in_strict_mode(monkeypatch, tmp_path):
+    dummy_model = DummyModel()
+
+    def fake_align_audio_file(**kwargs):
+        raise RuntimeError("alignment failed")
+
+    monkeypatch.setattr(cli, "load_model", lambda args: dummy_model)
+    monkeypatch.setattr(cli, "align_audio_file", fake_align_audio_file)
+    patch_soundfile_write(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        run_main(
+            monkeypatch,
+            [
+                "design",
+                "--text",
+                "hello",
+                "--output",
+                str(tmp_path / "out.wav"),
+                "--timestamps",
+                "--timestamp-strict",
+            ],
+        )
+
+
+def test_batch_writes_one_timestamp_json_per_output(monkeypatch, tmp_path):
+    dummy_model = DummyModel()
+
+    def fake_align_audio_file(**kwargs):
+        return {
+            "audio_path": kwargs["audio_path"],
+            "sample_rate": kwargs["sample_rate"],
+            "backend": kwargs["backend"],
+            "level": kwargs["level"],
+            "text": kwargs["text"],
+            "items": [{"text": kwargs["text"], "start": 0.0, "end": 0.5, "level": "word"}],
+            "warning": None,
+        }
+
+    input_file = tmp_path / "texts.txt"
+    input_file.write_text("hello\nworld\n", encoding="utf-8")
+    output_dir = tmp_path / "outs"
+
+    monkeypatch.setattr(cli, "load_model", lambda args: dummy_model)
+    monkeypatch.setattr(cli, "align_audio_file", fake_align_audio_file)
+    patch_soundfile_write(monkeypatch)
+
+    run_main(
+        monkeypatch,
+        [
+            "batch",
+            "--input",
+            str(input_file),
+            "--output-dir",
+            str(output_dir),
+            "--timestamps",
+        ],
+    )
+
+    first = json.loads((output_dir / "output_001.timestamps.json").read_text(encoding="utf-8"))
+    second = json.loads((output_dir / "output_002.timestamps.json").read_text(encoding="utf-8"))
+    assert first["text"] == "hello"
+    assert second["text"] == "world"
+
+
 def test_legacy_clone_with_prompt_file_still_works(monkeypatch, tmp_path, capsys):
     dummy_model = DummyModel()
     prompt_audio = tmp_path / "prompt.wav"
@@ -455,10 +590,7 @@ def test_clone_rejects_prompt_audio_without_transcript(monkeypatch, tmp_path, ca
     with pytest.raises(SystemExit):
         cli.main()
 
-    assert (
-        "--prompt-audio requires --prompt-text or --prompt-file"
-        in capsys.readouterr().err
-    )
+    assert "--prompt-audio requires --prompt-text or --prompt-file" in capsys.readouterr().err
 
 
 def test_clone_rejects_transcript_without_prompt_audio(monkeypatch, tmp_path, capsys):
@@ -480,9 +612,7 @@ def test_clone_rejects_transcript_without_prompt_audio(monkeypatch, tmp_path, ca
     with pytest.raises(SystemExit):
         cli.main()
 
-    assert (
-        "--prompt-text/--prompt-file requires --prompt-audio" in capsys.readouterr().err
-    )
+    assert "--prompt-text/--prompt-file requires --prompt-audio" in capsys.readouterr().err
 
 
 def test_batch_rejects_control_with_prompt_transcript(monkeypatch, tmp_path, capsys):

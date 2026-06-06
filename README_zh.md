@@ -231,6 +231,23 @@ voxcpm clone \
 # 批量处理
 voxcpm batch --input examples/input.txt --output-dir outs
 
+# 可选的生成后时间戳对齐（基于 stable-ts）
+pip install "voxcpm[timestamps]"
+voxcpm design \
+  --text "VoxCPM2带来全新语音合成体验。" \
+  --output out.wav \
+  --timestamps \
+  --timestamp-level word \
+  --timestamp-language zh
+
+# 字级时间戳是 best-effort，会基于词级对齐结果拆分
+voxcpm design \
+  --text "欢迎使用 VoxCPM2。" \
+  --output out.wav \
+  --timestamps \
+  --timestamp-level char \
+  --timestamp-language zh
+
 # 帮助
 voxcpm --help
 ```

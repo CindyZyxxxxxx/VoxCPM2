@@ -11,6 +11,8 @@ import os
 import sys
 from pathlib import Path
 
+from voxcpm.timestamps import align_audio_file
+
 DEFAULT_HF_MODEL_ID = "openbmb/VoxCPM2"
 
 # -----------------------------
@@ -86,9 +88,7 @@ def resolve_prompt_text(args, parser) -> str | None:
 
 
 def detect_model_architecture(args) -> str | None:
-    model_location = getattr(args, "model_path", None) or getattr(
-        args, "hf_model_id", None
-    )
+    model_location = getattr(args, "model_path", None) or getattr(args, "hf_model_id", None)
     if not model_location:
         return None
 
@@ -103,11 +103,7 @@ def detect_model_architecture(args) -> str | None:
     model_hint = str(model_location).lower()
     if "voxcpm2" in model_hint:
         return "voxcpm2"
-    if (
-        "voxcpm1.5" in model_hint
-        or "voxcpm-1.5" in model_hint
-        or "voxcpm_1.5" in model_hint
-    ):
+    if "voxcpm1.5" in model_hint or "voxcpm-1.5" in model_hint or "voxcpm_1.5" in model_hint:
         return "voxcpm"
 
     return None
@@ -121,9 +117,7 @@ def validate_prompt_related_args(args, parser, prompt_text: str | None):
         parser.error("--prompt-audio requires --prompt-text or --prompt-file.")
 
     if args.control and prompt_text:
-        parser.error(
-            "--control cannot be used together with --prompt-text or --prompt-file."
-        )
+        parser.error("--control cannot be used together with --prompt-text or --prompt-file.")
 
 
 def validate_reference_support(args, parser):
@@ -138,9 +132,7 @@ def validate_reference_support(args, parser):
 def validate_design_args(args, parser):
     prompt_text = resolve_prompt_text(args, parser)
     if args.prompt_audio or args.reference_audio or prompt_text:
-        parser.error(
-            "`design` does not accept prompt/reference audio. Use `clone` instead."
-        )
+        parser.error("`design` does not accept prompt/reference audio. Use `clone` instead.")
 
 
 def validate_clone_args(args, parser):
@@ -149,9 +141,7 @@ def validate_clone_args(args, parser):
     validate_reference_support(args, parser)
 
     if not args.prompt_audio and not args.reference_audio:
-        parser.error(
-            "`clone` requires --reference-audio, or --prompt-audio with --prompt-text/--prompt-file."
-        )
+        parser.error("`clone` requires --reference-audio, or --prompt-audio with --prompt-text/--prompt-file.")
 
     return prompt_text
 
@@ -173,9 +163,7 @@ def load_model(args):
 
     print("Loading VoxCPM model...", file=sys.stderr)
 
-    zipenhancer_path = getattr(args, "zipenhancer_path", None) or os.environ.get(
-        "ZIPENHANCER_MODEL_PATH", None
-    )
+    zipenhancer_path = getattr(args, "zipenhancer_path", None) or os.environ.get("ZIPENHANCER_MODEL_PATH", None)
 
     # Build LoRA config if provided
     lora_config = None
@@ -259,8 +247,7 @@ def _run_single(args, parser, *, text: str, output: str, prompt_text: str | None
         cfg_value=args.cfg_value,
         inference_timesteps=args.inference_timesteps,
         normalize=args.normalize,
-        denoise=args.denoise
-        and (args.prompt_audio is not None or args.reference_audio is not None),
+        denoise=args.denoise and (args.prompt_audio is not None or args.reference_audio is not None),
     )
 
     import soundfile as sf
@@ -269,22 +256,24 @@ def _run_single(args, parser, *, text: str, output: str, prompt_text: str | None
 
     duration = len(audio_array) / model.tts_model.sample_rate
     print(f"Saved audio to: {output_path} ({duration:.2f}s)", file=sys.stderr)
+    maybe_write_timestamps(
+        args,
+        text=text,
+        audio_path=output_path,
+        sample_rate=model.tts_model.sample_rate,
+    )
 
 
 def cmd_design(args, parser):
     validate_design_args(args, parser)
     final_text = build_final_text(args.text, args.control)
-    return _run_single(
-        args, parser, text=final_text, output=args.output, prompt_text=None
-    )
+    return _run_single(args, parser, text=final_text, output=args.output, prompt_text=None)
 
 
 def cmd_clone(args, parser):
     prompt_text = validate_clone_args(args, parser)
     final_text = build_final_text(args.text, args.control)
-    return _run_single(
-        args, parser, text=final_text, output=args.output, prompt_text=prompt_text
-    )
+    return _run_single(args, parser, text=final_text, output=args.output, prompt_text=prompt_text)
 
 
 def cmd_validate(args, parser):
@@ -306,8 +295,6 @@ def cmd_validate(args, parser):
 
 
 def cmd_batch(args, parser):
-    import soundfile as sf
-
     input_file = require_file_exists(args.input, parser, "input file")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -321,17 +308,15 @@ def cmd_batch(args, parser):
     prompt_text = validate_batch_args(args, parser)
     model = load_model(args)
 
+    import soundfile as sf
+
     prompt_audio_path = None
     if args.prompt_audio:
-        prompt_audio_path = str(
-            require_file_exists(args.prompt_audio, parser, "prompt audio file")
-        )
+        prompt_audio_path = str(require_file_exists(args.prompt_audio, parser, "prompt audio file"))
 
     reference_audio_path = None
     if args.reference_audio:
-        reference_audio_path = str(
-            require_file_exists(args.reference_audio, parser, "reference audio file")
-        )
+        reference_audio_path = str(require_file_exists(args.reference_audio, parser, "reference audio file"))
 
     success_count = 0
 
@@ -346,8 +331,7 @@ def cmd_batch(args, parser):
                 cfg_value=args.cfg_value,
                 inference_timesteps=args.inference_timesteps,
                 normalize=args.normalize,
-                denoise=args.denoise
-                and (prompt_audio_path is not None or reference_audio_path is not None),
+                denoise=args.denoise and (prompt_audio_path is not None or reference_audio_path is not None),
             )
 
             output_file = output_dir / f"output_{i:03d}.wav"
@@ -355,12 +339,53 @@ def cmd_batch(args, parser):
 
             duration = len(audio_array) / model.tts_model.sample_rate
             print(f"Saved: {output_file} ({duration:.2f}s)", file=sys.stderr)
+            maybe_write_timestamps(
+                args,
+                text=final_text,
+                audio_path=output_file,
+                sample_rate=model.tts_model.sample_rate,
+            )
             success_count += 1
 
         except Exception as e:
             print(f"Failed on line {i}: {e}", file=sys.stderr)
 
     print(f"\nBatch finished: {success_count}/{len(texts)} succeeded", file=sys.stderr)
+
+
+def default_timestamp_path(audio_path: Path) -> Path:
+    return audio_path.with_suffix(".timestamps.json")
+
+
+def maybe_write_timestamps(args, *, text: str, audio_path: Path, sample_rate: int) -> None:
+    if not getattr(args, "timestamps", False):
+        return
+
+    timestamp_output = getattr(args, "timestamp_output", None)
+    output_path = Path(timestamp_output) if timestamp_output else default_timestamp_path(audio_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = align_audio_file(
+            audio_path=str(audio_path),
+            text=text,
+            sample_rate=sample_rate,
+            backend=args.timestamp_backend,
+            level=args.timestamp_level,
+            model_name=args.timestamp_model,
+            device=args.timestamp_device,
+            language=args.timestamp_language,
+        )
+    except Exception as exc:
+        if getattr(args, "timestamp_strict", False):
+            raise SystemExit(f"Timestamp alignment failed: {exc}") from exc
+        print(f"Warning: Timestamp alignment failed: {exc}", file=sys.stderr)
+        return
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    print(f"Saved timestamps to: {output_path}", file=sys.stderr)
 
 
 # -----------------------------
@@ -387,9 +412,7 @@ def _add_common_generation_args(parser):
         default=10,
         help="Inference steps (int, recommended 4–30, default: 10)",
     )
-    parser.add_argument(
-        "--normalize", action="store_true", help="Enable text normalization"
-    )
+    parser.add_argument("--normalize", action="store_true", help="Enable text normalization")
 
 
 def _add_prompt_reference_args(parser):
@@ -398,12 +421,8 @@ def _add_prompt_reference_args(parser):
         "-pa",
         help="Prompt audio file path (continuation mode, requires --prompt-text or --prompt-file)",
     )
-    parser.add_argument(
-        "--prompt-text", "-pt", help="Text corresponding to the prompt audio"
-    )
-    parser.add_argument(
-        "--prompt-file", type=str, help="Text file corresponding to the prompt audio"
-    )
+    parser.add_argument("--prompt-text", "-pt", help="Text corresponding to the prompt audio")
+    parser.add_argument("--prompt-file", type=str, help="Text file corresponding to the prompt audio")
     parser.add_argument(
         "--reference-audio",
         "-ra",
@@ -430,15 +449,9 @@ def _add_model_args(parser):
         default="auto",
         help="Runtime device: auto, cpu, mps, cuda, or cuda:N (default: auto)",
     )
-    parser.add_argument(
-        "--cache-dir", type=str, help="Cache directory for Hub downloads"
-    )
-    parser.add_argument(
-        "--local-files-only", action="store_true", help="Disable network access"
-    )
-    parser.add_argument(
-        "--no-denoiser", action="store_true", help="Disable denoiser model loading"
-    )
+    parser.add_argument("--cache-dir", type=str, help="Cache directory for Hub downloads")
+    parser.add_argument("--local-files-only", action="store_true", help="Disable network access")
+    parser.add_argument("--no-denoiser", action="store_true", help="Disable denoiser model loading")
     parser.add_argument(
         "--no-optimize",
         action="store_true",
@@ -453,9 +466,7 @@ def _add_model_args(parser):
 
 def _add_lora_args(parser):
     parser.add_argument("--lora-path", type=str, help="Path to LoRA weights")
-    parser.add_argument(
-        "--lora-r", type=int, default=32, help="LoRA rank (positive int, default: 32)"
-    )
+    parser.add_argument("--lora-r", type=int, default=32, help="LoRA rank (positive int, default: 32)")
     parser.add_argument(
         "--lora-alpha",
         type=int,
@@ -468,16 +479,58 @@ def _add_lora_args(parser):
         default=0.0,
         help="LoRA dropout rate (0.0–1.0, default: 0.0)",
     )
-    parser.add_argument(
-        "--lora-disable-lm", action="store_true", help="Disable LoRA on LM layers"
-    )
-    parser.add_argument(
-        "--lora-disable-dit", action="store_true", help="Disable LoRA on DiT layers"
-    )
+    parser.add_argument("--lora-disable-lm", action="store_true", help="Disable LoRA on LM layers")
+    parser.add_argument("--lora-disable-dit", action="store_true", help="Disable LoRA on DiT layers")
     parser.add_argument(
         "--lora-enable-proj",
         action="store_true",
         help="Enable LoRA on projection layers",
+    )
+
+
+def _add_timestamp_args(parser, *, include_output: bool = True):
+    parser.add_argument(
+        "--timestamps",
+        action="store_true",
+        help="Run post-generation timestamp alignment and write a JSON sidecar file",
+    )
+    if include_output:
+        parser.add_argument(
+            "--timestamp-output",
+            type=str,
+            help="Output timestamp JSON path (default: output audio path with .timestamps.json suffix)",
+        )
+    parser.add_argument(
+        "--timestamp-level",
+        choices=["segment", "word", "char"],
+        default="word",
+        help="Timestamp granularity (default: word; char is best-effort)",
+    )
+    parser.add_argument(
+        "--timestamp-backend",
+        choices=["stable-ts"],
+        default="stable-ts",
+        help="Timestamp alignment backend (default: stable-ts)",
+    )
+    parser.add_argument(
+        "--timestamp-model",
+        default="base",
+        help="stable-ts Whisper model name (default: base)",
+    )
+    parser.add_argument(
+        "--timestamp-language",
+        default=None,
+        help="Language hint for timestamp alignment, e.g. zh or en",
+    )
+    parser.add_argument(
+        "--timestamp-device",
+        default=None,
+        help="Device for timestamp alignment, e.g. cuda or cpu",
+    )
+    parser.add_argument(
+        "--timestamp-strict",
+        action="store_true",
+        help="Fail the command if timestamp alignment fails",
     )
 
 
@@ -496,37 +549,25 @@ Examples:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    design_parser = subparsers.add_parser(
-        "design", help="Generate speech with VoxCPM2-first voice design"
-    )
+    design_parser = subparsers.add_parser("design", help="Generate speech with VoxCPM2-first voice design")
     _add_common_generation_args(design_parser)
     _add_prompt_reference_args(design_parser)
     _add_model_args(design_parser)
     _add_lora_args(design_parser)
-    design_parser.add_argument(
-        "--output", "-o", required=True, help="Output audio file path"
-    )
+    _add_timestamp_args(design_parser)
+    design_parser.add_argument("--output", "-o", required=True, help="Output audio file path")
 
-    clone_parser = subparsers.add_parser(
-        "clone", help="Clone a voice with reference/prompt audio"
-    )
+    clone_parser = subparsers.add_parser("clone", help="Clone a voice with reference/prompt audio")
     _add_common_generation_args(clone_parser)
     _add_prompt_reference_args(clone_parser)
     _add_model_args(clone_parser)
     _add_lora_args(clone_parser)
-    clone_parser.add_argument(
-        "--output", "-o", required=True, help="Output audio file path"
-    )
+    _add_timestamp_args(clone_parser)
+    clone_parser.add_argument("--output", "-o", required=True, help="Output audio file path")
 
-    batch_parser = subparsers.add_parser(
-        "batch", help="Batch-generate one line per output file"
-    )
-    batch_parser.add_argument(
-        "--input", "-i", required=True, help="Input text file (one text per line)"
-    )
-    batch_parser.add_argument(
-        "--output-dir", "-od", required=True, help="Output directory"
-    )
+    batch_parser = subparsers.add_parser("batch", help="Batch-generate one line per output file")
+    batch_parser.add_argument("--input", "-i", required=True, help="Input text file (one text per line)")
+    batch_parser.add_argument("--output-dir", "-od", required=True, help="Output directory")
     batch_parser.add_argument(
         "--control",
         type=str,
@@ -545,20 +586,17 @@ Examples:
         default=10,
         help="Inference steps (int, recommended 4–30, default: 10)",
     )
-    batch_parser.add_argument(
-        "--normalize", action="store_true", help="Enable text normalization"
-    )
+    batch_parser.add_argument("--normalize", action="store_true", help="Enable text normalization")
     _add_model_args(batch_parser)
     _add_lora_args(batch_parser)
+    _add_timestamp_args(batch_parser, include_output=False)
 
     # Validate subcommand
     validate_parser = subparsers.add_parser(
         "validate",
         help="Validate a training data manifest (JSONL) before fine-tuning",
     )
-    validate_parser.add_argument(
-        "--manifest", "-m", required=True, help="Path to JSONL training manifest"
-    )
+    validate_parser.add_argument("--manifest", "-m", required=True, help="Path to JSONL training manifest")
     validate_parser.add_argument(
         "--sample-rate",
         type=int,
@@ -571,22 +609,17 @@ Examples:
         default=0,
         help="Maximum number of samples to validate (0 = all, default: 0)",
     )
-    validate_parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Print per-sample progress"
-    )
+    validate_parser.add_argument("--verbose", "-v", action="store_true", help="Print per-sample progress")
 
     # Legacy root arguments
     parser.add_argument("--input", "-i", help="Input text file (batch mode only)")
-    parser.add_argument(
-        "--output-dir", "-od", help="Output directory (batch mode only)"
-    )
+    parser.add_argument("--output-dir", "-od", help="Output directory (batch mode only)")
     _add_common_generation_args(parser)
-    parser.add_argument(
-        "--output", "-o", help="Output audio file path (single or clone mode)"
-    )
+    parser.add_argument("--output", "-o", help="Output audio file path (single or clone mode)")
     _add_prompt_reference_args(parser)
     _add_model_args(parser)
     _add_lora_args(parser)
+    _add_timestamp_args(parser)
 
     return parser
 
@@ -595,9 +628,7 @@ def _dispatch_legacy(args, parser):
     warn_legacy_mode()
 
     if args.input and args.text:
-        parser.error(
-            "Use either batch mode (--input) or single mode (--text), not both."
-        )
+        parser.error("Use either batch mode (--input) or single mode (--text), not both.")
 
     if args.input:
         if not args.output_dir:
@@ -607,12 +638,7 @@ def _dispatch_legacy(args, parser):
     if not args.text or not args.output:
         parser.error("Single-sample legacy mode requires --text and --output")
 
-    if (
-        args.prompt_audio
-        or args.prompt_text
-        or args.prompt_file
-        or args.reference_audio
-    ):
+    if args.prompt_audio or args.prompt_text or args.prompt_file or args.reference_audio:
         return cmd_clone(args, parser)
 
     return cmd_design(args, parser)

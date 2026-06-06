@@ -59,6 +59,9 @@ dev = [
     "flake8>=3.8",
     "pre-commit>=2.0",
 ]
+timestamps = [
+    "stable-ts>=2.19.1",
+]
 
 [project.scripts]
 voxcpm = "voxcpm.cli:main"
