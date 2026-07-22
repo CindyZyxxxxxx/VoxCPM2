@@ -51,9 +51,19 @@ def train(
     batch_size: int = 1,
     grad_accum_steps: int = 1,
     num_workers: int = 2,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 0,
+    worker_cpu_threads: int = 0,
     num_iters: int = 100_000,
     log_interval: int = 100,
     valid_interval: int = 1_000,
+    quick_valid_batches: int = 10,
+    full_valid_interval: int = 0,
+    val_audio_interval: int = 1_000,
+    val_audio_num_samples: int = 2,
+    val_audio_per_dialect: int = 1,
+    save_val_audio_wavs: bool = False,
+    val_audio_dir: str = "",
     save_interval: int = 10_000,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-2,
@@ -122,7 +132,10 @@ def train(
     train_ds = train_ds.map(tokenize, batched=True, remove_columns=["text"])
     # Save original validation texts for audio generation display
     val_texts = None
+    val_dialects = []
     if val_ds is not None:
+        if "dialect" in val_ds.column_names:
+            val_dialects = sorted(str(item) for item in set(val_ds["dialect"]))
         val_texts = list(val_ds["text"])  # Save original texts
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
@@ -161,6 +174,9 @@ def train(
         batch_size=batch_size,
         num_workers=num_workers,
         drop_last=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        worker_cpu_threads=worker_cpu_threads,
     )
     val_loader = (
         build_dataloader(
@@ -169,8 +185,27 @@ def train(
             batch_size=batch_size,
             num_workers=num_workers,
             drop_last=False,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            worker_cpu_threads=worker_cpu_threads,
+            shuffle=False,
         )
         if val_ds is not None
+        else None
+    )
+    full_val_loader = (
+        build_dataloader(
+            val_ds,
+            accelerator=accelerator,
+            batch_size=1,
+            num_workers=num_workers,
+            drop_last=False,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            worker_cpu_threads=worker_cpu_threads,
+            shuffle=False,
+        )
+        if val_ds is not None and full_valid_interval and full_valid_interval > 0
         else None
     )
 
@@ -334,23 +369,62 @@ def train(
                 loss_values["grad_norm"] = float(grad_norm)
                 tracker.log_metrics(loss_values, split="train")
 
-            if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
-                validate(
+            is_last_step = step == num_iters - 1
+            if val_loader is not None and (step % valid_interval == 0 or is_last_step):
+                validate_loss(
                     model,
                     val_loader,
                     batch_processor,
                     accelerator,
                     tracker,
                     lambdas,
-                    writer=writer,
                     step=step,
-                    val_ds=val_ds,
-                    audio_vae=audio_vae_for_gen,
+                    split="val/quick",
+                    max_batches=quick_valid_batches,
+                    group_by="",
+                )
+
+            if (
+                full_val_loader is not None
+                and full_valid_interval
+                and full_valid_interval > 0
+                and (step % full_valid_interval == 0 or is_last_step)
+            ):
+                validate_loss(
+                    model,
+                    full_val_loader,
+                    batch_processor,
+                    accelerator,
+                    tracker,
+                    lambdas,
+                    step=step,
+                    split="val/full",
+                    max_batches=0,
+                    group_by="dialect",
+                    group_values=val_dialects,
+                )
+
+            if (
+                val_loader is not None
+                and val_audio_interval
+                and val_audio_interval > 0
+                and (step % val_audio_interval == 0 or is_last_step)
+            ):
+                validate_audio(
+                    model,
+                    val_ds,
+                    audio_vae_for_gen,
+                    writer,
+                    step,
+                    accelerator,
                     sample_rate=sample_rate,
                     out_sample_rate=out_sr,
                     val_texts=val_texts,
-                    tokenizer=tokenizer,
-                    valid_interval=valid_interval,
+                    num_samples=val_audio_num_samples,
+                    samples_per_dialect=val_audio_per_dialect,
+                    save_wavs=save_val_audio_wavs,
+                    wav_dir=val_audio_dir or str(save_dir / "val_audio"),
+                    tracker=tracker,
                 )
 
             if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
@@ -362,38 +436,54 @@ def train(
         writer.close()
 
 
-def validate(
+def _metric_value(value):
+    return value.item() if isinstance(value, torch.Tensor) else float(value)
+
+
+def _all_reduce_sum(accelerator, value: torch.Tensor):
+    if hasattr(accelerator, "all_reduce"):
+        return accelerator.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+    return value
+
+
+def validate_loss(
     model,
     val_loader,
     batch_processor,
     accelerator,
     tracker,
     lambdas,
-    writer=None,
     step=0,
-    val_ds=None,
-    audio_vae=None,
-    sample_rate=22050,
-    out_sample_rate=0,
-    val_texts=None,
-    tokenizer=None,
-    valid_interval=1000,
+    split="val/quick",
+    max_batches=10,
+    group_by="",
+    group_values=None,
 ):
-    """Validate and generate sample audio"""
-    import numpy as np  # noqa: F401
+    """Run validation loss only.
+
+    ``max_batches`` > 0 performs quick validation on the first N validation
+    batches. ``max_batches`` <= 0 runs the full validation loader. Losses are
+    weighted by the number of valid target audio tokens in ``loss_mask``.
+    """
     from collections import defaultdict
 
     model.eval()
-    total_losses = []
-    sub_losses = defaultdict(list)  # Track individual sub-losses
+    device = accelerator.device
+    loss_sums = defaultdict(lambda: torch.zeros((), device=device, dtype=torch.float32))
+    group_loss_sums = defaultdict(lambda: defaultdict(lambda: torch.zeros((), device=device, dtype=torch.float32)))
+    group_token_sums = defaultdict(lambda: torch.zeros((), device=device, dtype=torch.float32))
+    token_sum = torch.zeros((), device=device, dtype=torch.float32)
     num_batches = 0
-    max_val_batches = 10
 
     with torch.no_grad():
         for batch in val_loader:
-            if num_batches >= max_val_batches:
+            if max_batches and max_batches > 0 and num_batches >= max_batches:
                 break
+
             processed = batch_processor(batch)
+            valid_tokens = processed["loss_mask"].sum().detach().to(device=device, dtype=torch.float32)
+            valid_tokens = torch.clamp(valid_tokens, min=1.0)
+
             with accelerator.autocast(dtype=torch.bfloat16):
                 outputs = model(
                     processed["text_tokens"],
@@ -406,67 +496,248 @@ def validate(
                     progress=0.0,
                     sample_generate=False,
                 )
-            total = 0.0
+
+            total = torch.zeros((), device=device, dtype=torch.float32)
+            batch_loss_values = {}
             for key, value in outputs.items():
                 if key.startswith("loss/"):
-                    weighted_loss = lambdas.get(key, 1.0) * value
-                    total += weighted_loss
-                    sub_losses[key].append(value.detach())
-            total_losses.append(total.detach())
+                    detached = value.detach().to(device=device, dtype=torch.float32)
+                    batch_loss_values[key] = detached
+                    loss_sums[key] += detached * valid_tokens
+                    total = total + lambdas.get(key, 1.0) * detached
+            loss_sums["loss/total"] += total * valid_tokens
+            token_sum += valid_tokens
+
+            if group_by and group_by in batch and batch[group_by]:
+                groups = [str(group) if group is not None else "unknown" for group in batch[group_by]]
+                sample_tokens = processed["loss_mask"].sum(dim=1).detach().to(device=device, dtype=torch.float32)
+                for group in sorted(set(groups)):
+                    mask = torch.tensor([item == group for item in groups], device=device, dtype=torch.bool)
+                    group_tokens = torch.clamp(sample_tokens[mask].sum(), min=1.0)
+                    group_token_sums[group] += group_tokens
+                    for key, value in batch_loss_values.items():
+                        group_loss_sums[group][key] += value * group_tokens
+                    group_loss_sums[group]["loss/total"] += total * group_tokens
+
             num_batches += 1
 
-    if total_losses:
-        # Compute mean total loss
-        mean_total_loss = torch.stack(total_losses).mean()
-        accelerator.all_reduce(mean_total_loss)
+    if num_batches == 0:
+        if accelerator.rank == 0:
+            tracker.print(f"[Warning] Skip {split}: no validation batches were processed")
+        model.train()
+        return
 
-        # Compute mean of each sub-loss
-        val_metrics = {"loss/total": mean_total_loss.item()}
-        for key, values in sub_losses.items():
-            mean_sub_loss = torch.stack(values).mean()
-            accelerator.all_reduce(mean_sub_loss)
-            val_metrics[key] = mean_sub_loss.item()
+    token_sum = _all_reduce_sum(accelerator, token_sum)
+    metrics = {
+        "tokens": _metric_value(token_sum),
+        "batches": float(num_batches),
+    }
+    for key, value in loss_sums.items():
+        reduced = _all_reduce_sum(accelerator, value)
+        metrics[key] = _metric_value(reduced / torch.clamp(token_sum, min=1.0))
 
-        tracker.log_metrics(val_metrics, split="val")
+    if group_by and group_values:
+        for group in group_values:
+            reduced_group_tokens = _all_reduce_sum(accelerator, group_token_sums[group])
+            for key in loss_sums:
+                value = group_loss_sums[group][key]
+                reduced_value = _all_reduce_sum(accelerator, value)
+                metric_name = f"{group_by}/{group}/{key}"
+                metrics[metric_name] = _metric_value(reduced_value / torch.clamp(reduced_group_tokens, min=1.0))
 
-    # Generate sample audio for TensorBoard display
-    if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
-        try:
-            generate_sample_audio(
-                model,
-                val_ds,
-                audio_vae,
-                writer,
-                step,
-                accelerator,
-                sample_rate,
-                out_sample_rate=out_sample_rate,
-                val_texts=val_texts,
-                tokenizer=tokenizer,
-                valid_interval=valid_interval,
-                tracker=tracker,
-            )
-        except Exception as e:
-            tracker.print(f"[Warning] Failed to generate sample audio: {e}")
-            import traceback
-            import io
-
-            buf = io.StringIO()
-            traceback.print_exc(file=buf)
-            tracker.print(buf.getvalue())
-    else:
-        # Log why audio generation was skipped
-        missing = []
-        if writer is None:
-            missing.append("writer")
-        if val_ds is None:
-            missing.append("val_ds")
-        if audio_vae is None:
-            missing.append("audio_vae")
-        if missing and accelerator.rank == 0:
-            tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
-
+    tracker.log_metrics(metrics, split=split)
     model.train()
+
+
+def _audio_array(sample, column, sample_rate):
+    import numpy as np
+
+    audio = sample.get(column)
+    if not isinstance(audio, dict) or "array" not in audio:
+        return None, None, None
+
+    audio_np = np.array(audio["array"], dtype=np.float32)
+    audio_sr = audio.get("sampling_rate", sample_rate)
+    audio_path = audio.get("path")
+    return audio_np, audio_sr, audio_path
+
+
+def _resample_audio(audio_np, source_sr, target_sr):
+    if audio_np is None or source_sr == target_sr:
+        return audio_np
+    import torchaudio.functional as F
+
+    return F.resample(torch.from_numpy(audio_np).unsqueeze(0), source_sr, target_sr).squeeze(0).numpy()
+
+
+def _safe_tag(value):
+    text = str(value) if value is not None else "unknown"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+
+
+def _select_audio_validation_indices(val_ds, num_samples: int, samples_per_dialect: int):
+    if len(val_ds) == 0 or num_samples <= 0:
+        return []
+
+    if "dialect" not in val_ds.column_names:
+        return list(range(min(num_samples, len(val_ds))))
+
+    selected = []
+    per_dialect_counts = {}
+    for idx in range(len(val_ds)):
+        sample = val_ds[idx]
+        dialect = str(sample.get("dialect") or "unknown")
+        count = per_dialect_counts.get(dialect, 0)
+        if count >= max(samples_per_dialect, 1):
+            continue
+        selected.append(idx)
+        per_dialect_counts[dialect] = count + 1
+        if len(selected) >= num_samples:
+            break
+
+    if not selected:
+        return list(range(min(num_samples, len(val_ds))))
+    return selected
+
+
+def validate_audio(
+    model,
+    val_ds,
+    audio_vae,
+    writer,
+    step,
+    accelerator,
+    sample_rate=22050,
+    out_sample_rate=0,
+    val_texts=None,
+    num_samples=2,
+    samples_per_dialect=1,
+    save_wavs=False,
+    wav_dir="",
+    tracker=None,
+):
+    """Generate fixed validation samples, log them to TensorBoard, and optionally save wavs."""
+    if writer is None or val_ds is None or audio_vae is None or accelerator.rank != 0:
+        return
+
+    import numpy as np
+
+    log = tracker.print if tracker else print
+    selected_indices = _select_audio_validation_indices(val_ds, num_samples, samples_per_dialect)
+    log(f"[Audio] Starting audio validation for {len(selected_indices)} samples at step {step}")
+
+    unwrapped_model = accelerator.unwrap(model)
+    gen_sr = out_sample_rate if out_sample_rate > 0 else sample_rate
+    wav_root = Path(wav_dir) / f"step_{step:07d}" if save_wavs and wav_dir else None
+    if wav_root is not None:
+        wav_root.mkdir(parents=True, exist_ok=True)
+
+    for sample_idx in selected_indices:
+        sample = val_ds[sample_idx]
+        text = val_texts[sample_idx] if val_texts and sample_idx < len(val_texts) else "Hello, this is a test."
+        sample_id = sample.get("sample_id", f"sample_{sample_idx}")
+        dialect = sample.get("dialect", "unknown")
+        tag = f"val_audio/{_safe_tag(dialect)}/{_safe_tag(sample_id)}"
+
+        gt_audio_np = None
+        ref_audio_np = None
+        reference_wav_path = ""
+        try:
+            gt_audio_np, gt_sr, _ = _audio_array(sample, "audio", sample_rate)
+            gt_audio_np = _resample_audio(gt_audio_np, gt_sr, sample_rate) if gt_audio_np is not None else None
+
+            ref_audio_np, ref_sr, ref_path = _audio_array(sample, "ref_audio", sample_rate)
+            ref_audio_np = _resample_audio(ref_audio_np, ref_sr, sample_rate) if ref_audio_np is not None else None
+            reference_wav_path = ref_path or ""
+        except Exception as e:
+            log(f"[Warning] Failed to load validation audio for sample {sample_idx}: {e}")
+
+        prev_training = unwrapped_model.training
+        try:
+            unwrapped_model.eval()
+            unwrapped_model.audio_vae = audio_vae.to(torch.float32)
+
+            generate_kwargs = {
+                "target_text": text,
+                "inference_timesteps": 10,
+                "cfg_value": 2.0,
+                "seed": 42,
+            }
+            if reference_wav_path:
+                generate_kwargs["reference_wav_path"] = reference_wav_path
+                log(f"[Audio] Generating sample {sample_idx} with ref_audio: {reference_wav_path}")
+            else:
+                log(f"[Audio] Generating sample {sample_idx} without ref_audio")
+
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if torch.cuda.is_available()
+                else contextlib.nullcontext()
+            )
+            with torch.no_grad():
+                with autocast_ctx:
+                    generated = unwrapped_model.generate(**generate_kwargs)
+
+            if generated is None or len(generated) == 0:
+                log(f"[Warning] Generated audio is empty for sample {sample_idx}")
+                continue
+
+            gen_audio_np = (
+                generated.cpu().float().numpy().flatten()
+                if isinstance(generated, torch.Tensor)
+                else np.array(generated, dtype=np.float32).flatten()
+            )
+            gen_audio_np = normalize_audio(gen_audio_np)
+
+            writer.add_audio(f"{tag}/generated", gen_audio_np, global_step=step, sample_rate=gen_sr)
+            if gt_audio_np is not None:
+                writer.add_audio(
+                    f"{tag}/ground_truth", normalize_audio(gt_audio_np), global_step=step, sample_rate=sample_rate
+                )
+            if ref_audio_np is not None:
+                writer.add_audio(
+                    f"{tag}/conditioning_ref", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate
+                )
+
+            if wav_root is not None:
+                import soundfile as sf
+
+                sf.write(wav_root / f"{_safe_tag(dialect)}_{_safe_tag(sample_id)}_generated.wav", gen_audio_np, gen_sr)
+                if gt_audio_np is not None:
+                    sf.write(
+                        wav_root / f"{_safe_tag(dialect)}_{_safe_tag(sample_id)}_ground_truth.wav",
+                        normalize_audio(gt_audio_np),
+                        sample_rate,
+                    )
+                if ref_audio_np is not None:
+                    sf.write(
+                        wav_root / f"{_safe_tag(dialect)}_{_safe_tag(sample_id)}_conditioning_ref.wav",
+                        normalize_audio(ref_audio_np),
+                        sample_rate,
+                    )
+
+            try:
+                mel_gen = compute_mel_spectrogram(gen_audio_np, gen_sr)
+                mel_gt = compute_mel_spectrogram(gt_audio_np, sample_rate) if gt_audio_np is not None else None
+                fig = create_mel_figure(gen_audio_np, mel_gen, gen_sr, step, gt_audio_np, mel_gt)
+                writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
+            except Exception as e:
+                log(f"[Warning] Failed to create mel spectrogram for sample {sample_idx}: {e}")
+
+        except Exception as e:
+            log(f"[Warning] Failed to generate validation audio for sample {sample_idx}: {e}")
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            try:
+                unwrapped_model.audio_vae = None
+                if prev_training:
+                    unwrapped_model.train()
+                else:
+                    unwrapped_model.eval()
+            except Exception as e:
+                log(f"[Warning] Failed to restore model state: {e}")
 
 
 def compute_mel_spectrogram(audio_np, sample_rate, n_mels=128):
@@ -535,213 +806,138 @@ def normalize_audio(audio_np):
     return audio_np / max_val * 0.9 if max_val > 0 else audio_np
 
 
-def generate_sample_audio(
-    model,
-    val_ds,
-    audio_vae,
-    writer,
-    step,
-    accelerator,
-    sample_rate=22050,
-    out_sample_rate=0,
-    val_texts=None,
-    tokenizer=None,
-    pretrained_path=None,
-    valid_interval=1000,
-    tracker=None,
-):
-    """Select 2 fixed validation samples, generate audio and log to TensorBoard"""
-    import numpy as np
-
-    log = tracker.print if tracker else print
-    num_samples = min(2, len(val_ds))
-    log(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
-
-    unwrapped_model = accelerator.unwrap(model)
-    # Determine the correct output sample rate for generated audio.
-    # out_sample_rate is the decoder output rate (e.g. 48kHz for V2);
-    # sample_rate is the encoder input rate (e.g. 16kHz for V2).
-    gen_sr = out_sample_rate if out_sample_rate > 0 else sample_rate
-
-    for i in range(num_samples):
-        sample = val_ds[i]
-        text = val_texts[i] if val_texts and i < len(val_texts) else "Hello, this is a test."
-
-        # Load reference audio
-        ref_audio_np = None
-        try:
-            if "audio" in sample and isinstance(sample["audio"], dict) and "array" in sample["audio"]:
-                ref_audio_np = np.array(sample["audio"]["array"], dtype=np.float32)
-                ref_sr = sample["audio"].get("sampling_rate", sample_rate)
-                if ref_sr != sample_rate:
-                    import torchaudio.functional as F
-
-                    ref_audio_np = (
-                        F.resample(torch.from_numpy(ref_audio_np).unsqueeze(0), ref_sr, sample_rate).squeeze(0).numpy()
-                    )
-                log(f"[Audio] Loaded reference audio for sample {i}: duration={len(ref_audio_np)/sample_rate:.2f}s")
-        except Exception as e:
-            log(f"[Warning] Failed to load reference audio: {e}")
-
-        # Preserve the original mode so validation failures do not leak into training.
-        prev_training = unwrapped_model.training
-        try:
-            # Inference setup
-            unwrapped_model.eval()
-            # unwrapped_model.to(torch.bfloat16)
-            unwrapped_model.audio_vae = audio_vae.to(torch.float32)
-
-            log(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
-            autocast_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if torch.cuda.is_available()
-                else contextlib.nullcontext()
-            )
-            with torch.no_grad():
-                with autocast_ctx:
-                    generated = unwrapped_model.generate(
-                        target_text=text, inference_timesteps=10, cfg_value=2.0, seed=42
-                    )
-
-            # Restore training setup
-            # unwrapped_model.to(torch.float32)
-            # unwrapped_model.audio_vae = None
-
-            if generated is None or len(generated) == 0:
-                log(f"[Warning] Generated audio is empty for sample {i}")
-                continue
-
-            # Process generated audio
-            gen_audio_np = (
-                generated.cpu().float().numpy().flatten()
-                if isinstance(generated, torch.Tensor)
-                else np.array(generated, dtype=np.float32).flatten()
-            )
-            gen_audio_np = normalize_audio(gen_audio_np)
-
-            tag = f"val_sample_{i}"
-            writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=gen_sr)
-            log(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/gen_sr:.2f}s")
-
-            # Log reference audio (at encoder input rate, which is what val_ds provides)
-            if ref_audio_np is not None:
-                writer.add_audio(
-                    f"{tag}/reference_audio", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate
-                )
-
-            # Generate mel spectrogram figure
-            try:
-                mel_gen = compute_mel_spectrogram(gen_audio_np, gen_sr)
-                mel_ref = compute_mel_spectrogram(ref_audio_np, sample_rate) if ref_audio_np is not None else None
-                fig = create_mel_figure(gen_audio_np, mel_gen, gen_sr, step, ref_audio_np, mel_ref)
-                writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
-                log(f"[Audio] Created mel spectrogram figure for sample {i}")
-            except Exception as e:
-                log(f"[Warning] Failed to create mel spectrogram: {e}")
-
-        except Exception as e:
-            log(f"[Warning] Failed to generate audio for sample {i}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-        finally:
-            # Always restore the training state, even if generation fails.
-            try:
-                # unwrapped_model.to(torch.float32)
-                unwrapped_model.audio_vae = None
-                if prev_training:
-                    unwrapped_model.train()
-                else:
-                    unwrapped_model.eval()
-            except Exception as e:
-                log(f"[Warning] Failed to restore model state: {e}")
-
-
 def load_checkpoint(model, optimizer, scheduler, save_dir: Path, rank: int = 0):
     """
-    Load the latest checkpoint if it exists.
+    Load the latest valid checkpoint if it exists.
     Called by all ranks so that distributed state stays aligned.
     Returns the step number to resume from, or 0 if no checkpoint found.
     """
-    latest_folder = save_dir / "latest"
-    if not latest_folder.exists():
-        return 0
-
     unwrapped = model.module if hasattr(model, "module") else model
     lora_cfg = unwrapped.lora_config
 
-    # Load model weights
+    for checkpoint_dir in _checkpoint_candidates(save_dir, rank=rank):
+        resume_step = _try_load_checkpoint_dir(checkpoint_dir, unwrapped, lora_cfg, optimizer, scheduler, rank=rank)
+        if resume_step is not None:
+            return resume_step
+
+    return 0
+
+
+def _checkpoint_candidates(save_dir: Path, rank: int = 0):
+    seen = set()
+
+    def _add(candidate: Path):
+        resolved = candidate.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        yield candidate
+
+    latest_meta = save_dir / "latest.json"
+    if latest_meta.exists():
+        try:
+            with open(latest_meta, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            checkpoint_dir = Path(meta.get("checkpoint_dir", ""))
+            if not checkpoint_dir.is_absolute():
+                checkpoint_dir = save_dir / checkpoint_dir
+            if checkpoint_dir.is_dir():
+                yield from _add(checkpoint_dir)
+            elif rank == 0:
+                print(f"Warning: latest checkpoint pointer is invalid: {checkpoint_dir}", file=sys.stderr)
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: failed to read latest checkpoint pointer {latest_meta}: {e}", file=sys.stderr)
+
+    if save_dir.exists():
+        step_dirs = []
+        for folder in save_dir.iterdir():
+            if folder.is_dir() and folder.name.startswith("step_"):
+                step = _checkpoint_step(folder)
+                if step is not None:
+                    step_dirs.append((step, folder))
+        for _, folder in sorted(step_dirs, reverse=True):
+            yield from _add(folder)
+
+    legacy_latest = save_dir / "latest"
+    if legacy_latest.is_dir():
+        yield from _add(legacy_latest)
+    elif legacy_latest.exists() and rank == 0:
+        print(f"Warning: ignoring non-directory legacy latest checkpoint path: {legacy_latest}", file=sys.stderr)
+
+
+def _checkpoint_step(checkpoint_dir: Path):
+    state_path = checkpoint_dir / "training_state.json"
+    if state_path.exists():
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return int(state.get("step", 0))
+        except Exception:
+            pass
+
+    if checkpoint_dir.name.startswith("step_"):
+        try:
+            return int(checkpoint_dir.name.split("_")[1])
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def _try_load_checkpoint_dir(checkpoint_dir: Path, unwrapped, lora_cfg, optimizer, scheduler, rank: int = 0):
     if lora_cfg is not None:
-        # LoRA: load lora_weights
-        lora_weights_path = latest_folder / "lora_weights.safetensors"
-        if not lora_weights_path.exists():
-            lora_weights_path = latest_folder / "lora_weights.ckpt"
-
-        if lora_weights_path.exists():
-            if lora_weights_path.suffix == ".safetensors":
-                from safetensors.torch import load_file
-
-                state_dict = load_file(str(lora_weights_path))
-            else:
-                ckpt = torch.load(lora_weights_path, map_location="cpu", weights_only=True)
-                state_dict = ckpt.get("state_dict", ckpt)
-
-            unwrapped.load_state_dict(state_dict, strict=False)
-            if rank == 0:
-                print(f"Loaded LoRA weights from {lora_weights_path}", file=sys.stderr)
+        weights_path = checkpoint_dir / "lora_weights.safetensors"
+        if not weights_path.exists():
+            weights_path = checkpoint_dir / "lora_weights.ckpt"
+        weights_kind = "LoRA weights"
     else:
-        # Full finetune: load model.safetensors or pytorch_model.bin
-        model_path = latest_folder / "model.safetensors"
-        if not model_path.exists():
-            model_path = latest_folder / "pytorch_model.bin"
+        weights_path = checkpoint_dir / "model.safetensors"
+        if not weights_path.exists():
+            weights_path = checkpoint_dir / "pytorch_model.bin"
+        weights_kind = "model weights"
 
-        if model_path.exists():
-            if model_path.suffix == ".safetensors":
-                from safetensors.torch import load_file
+    if not weights_path.exists():
+        if rank == 0:
+            print(f"Warning: skipping checkpoint without {weights_kind}: {checkpoint_dir}", file=sys.stderr)
+        return None
 
-                state_dict = load_file(str(model_path))
-            else:
-                ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
-                state_dict = ckpt.get("state_dict", ckpt)
+    if weights_path.suffix == ".safetensors":
+        from safetensors.torch import load_file
 
-            unwrapped.load_state_dict(state_dict, strict=False)
-            if rank == 0:
-                print(f"Loaded model weights from {model_path}", file=sys.stderr)
+        state_dict = load_file(str(weights_path))
+    else:
+        ckpt = torch.load(weights_path, map_location="cpu", weights_only=True)
+        state_dict = ckpt.get("state_dict", ckpt)
 
-    # Load optimizer state
-    optimizer_path = latest_folder / "optimizer.pth"
+    unwrapped.load_state_dict(state_dict, strict=False)
+    if rank == 0:
+        print(f"Loaded {weights_kind} from {weights_path}", file=sys.stderr)
+
+    optimizer_path = checkpoint_dir / "optimizer.pth"
     if optimizer_path.exists():
         optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=True))
         if rank == 0:
             print(f"Loaded optimizer state from {optimizer_path}", file=sys.stderr)
+    elif rank == 0:
+        print(f"Warning: optimizer state not found in checkpoint: {checkpoint_dir}", file=sys.stderr)
 
-    # Load scheduler state
-    scheduler_path = latest_folder / "scheduler.pth"
+    scheduler_path = checkpoint_dir / "scheduler.pth"
     if scheduler_path.exists():
         scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu", weights_only=True))
         if rank == 0:
             print(f"Loaded scheduler state from {scheduler_path}", file=sys.stderr)
+    elif rank == 0:
+        print(f"Warning: scheduler state not found in checkpoint: {checkpoint_dir}", file=sys.stderr)
 
-    state_path = latest_folder / "training_state.json"
-    if state_path.exists():
-        with open(state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        resume_step = int(state.get("step", 0))
+    resume_step = _checkpoint_step(checkpoint_dir)
+    if resume_step is None:
         if rank == 0:
-            print(f"Resuming from step {resume_step}", file=sys.stderr)
-        return resume_step
+            print(f"Warning: checkpoint has no valid step metadata: {checkpoint_dir}", file=sys.stderr)
+        return None
 
-    # Fallback for older checkpoints without metadata.
-    step_folders = [d for d in save_dir.iterdir() if d.is_dir() and d.name.startswith("step_")]
-    if step_folders:
-        steps = [int(d.name.split("_")[1]) for d in step_folders]
-        resume_step = max(steps)
-        if rank == 0:
-            print(f"Resuming from step {resume_step}", file=sys.stderr)
-        return resume_step
-
-    return 0
+    if rank == 0:
+        print(f"Resuming from step {resume_step}", file=sys.stderr)
+    return resume_step
 
 
 def save_checkpoint(
@@ -816,14 +1012,21 @@ def save_checkpoint(
     with open(folder / "training_state.json", "w", encoding="utf-8") as f:
         json.dump({"step": int(step)}, f)
 
-    # Update (or create) a `latest` folder by copying the most recent checkpoint
-    latest_link = save_dir / "latest"
+    # Atomically update a lightweight `latest.json` pointer instead of copying
+    # the whole checkpoint directory on every save.
+    latest_meta = save_dir / "latest.json"
+    tmp_meta = save_dir / "latest.json.tmp"
+    metadata = {
+        "step": int(step),
+        "checkpoint_dir": tag,
+        "checkpoint_format": "lora" if lora_cfg is not None else "full",
+    }
     try:
-        if latest_link.exists():
-            shutil.rmtree(latest_link)
-        shutil.copytree(folder, latest_link)
-    except Exception:
-        print(f"Warning: failed to update latest checkpoint at {latest_link}", file=sys.stderr)
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_meta, latest_meta)
+    except Exception as e:
+        print(f"Warning: failed to update latest checkpoint pointer at {latest_meta}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
