@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import random
 import typing
@@ -10,6 +11,18 @@ import torch
 import torch.distributed as dist
 import torch.utils.data
 from torch.nn.parallel import DistributedDataParallel
+
+
+def _init_dataloader_worker(worker_id: int, *, worker_cpu_threads: int):
+    _ = worker_id
+    if worker_cpu_threads > 0:
+        os.environ["OMP_NUM_THREADS"] = str(worker_cpu_threads)
+        os.environ["MKL_NUM_THREADS"] = str(worker_cpu_threads)
+        torch.set_num_threads(worker_cpu_threads)
+
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class Accelerator:
@@ -138,6 +151,9 @@ class Accelerator:
         shuffle: bool = True,
         collate_fn=None,
         drop_last: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
+        worker_cpu_threads: int = 0,
     ) -> torch.utils.data.DataLoader:
         if self.world_size > 1:
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -147,16 +163,27 @@ class Accelerator:
         else:
             sampler = None
 
-        return torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle if sampler is None else False,
-            sampler=sampler,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            drop_last=drop_last,
-            pin_memory=True,
-        )
+        dataloader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle if sampler is None else False,
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "collate_fn": collate_fn,
+            "drop_last": drop_last,
+            "pin_memory": True,
+        }
+
+        if num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = persistent_workers
+            if prefetch_factor is not None and prefetch_factor > 0:
+                dataloader_kwargs["prefetch_factor"] = prefetch_factor
+            if worker_cpu_threads and worker_cpu_threads > 0:
+                dataloader_kwargs["worker_init_fn"] = functools.partial(
+                    _init_dataloader_worker,
+                    worker_cpu_threads=worker_cpu_threads,
+                )
+
+        return torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
     @staticmethod
     def unwrap(model: torch.nn.Module) -> torch.nn.Module:

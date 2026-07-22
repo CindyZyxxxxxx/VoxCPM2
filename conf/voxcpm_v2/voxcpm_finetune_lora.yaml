@@ -6,9 +6,19 @@ out_sample_rate: 48000    # AudioVAE decoder output rate; used for TensorBoard a
 batch_size: 2
 grad_accum_steps: 8  # effective batch size = batch_size × grad_accum_steps = 16
 num_workers: 8
+persistent_workers: true
+prefetch_factor: 4
+worker_cpu_threads: 1
 num_iters: 1000
 log_interval: 10
 valid_interval: 500
+quick_valid_batches: 10
+full_valid_interval: 1000
+val_audio_interval: 1000
+val_audio_num_samples: 2
+val_audio_per_dialect: 1
+save_val_audio_wavs: false
+val_audio_dir: ""
 save_interval: 500
 learning_rate: 0.0001
 weight_decay: 0.01
