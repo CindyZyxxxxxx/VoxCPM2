@@ -14,6 +14,7 @@ DEFAULT_TEXT_COLUMN = "text"
 DEFAULT_AUDIO_COLUMN = "audio"
 DEFAULT_REF_AUDIO_COLUMN = "ref_audio"
 DEFAULT_ID_COLUMN = "dataset_id"
+METADATA_COLUMNS = ("sample_id", "dialect", "language")
 
 
 @argbind.bind()
@@ -145,6 +146,9 @@ class HFVoxCPMDataset(TorchDataset):
             "dataset_id": item.get(DEFAULT_ID_COLUMN, 0),
             "is_prompt": item.get("is_prompt", False),
         }
+        for column in METADATA_COLUMNS:
+            if column in self.dataset.column_names:
+                sample[column] = item.get(column)
         if self.has_ref_audio:
             ref = item.get(DEFAULT_REF_AUDIO_COLUMN)
             sample["ref_audio_array"] = ref["array"] if ref else self._SENTINEL
@@ -181,6 +185,9 @@ class HFVoxCPMDataset(TorchDataset):
             "dataset_ids": dataset_ids,
             "is_prompts": is_prompts,
         }
+        for column in METADATA_COLUMNS:
+            if column in batch[0]:
+                result[column] = [sample.get(column) for sample in batch]
 
         if "ref_audio_array" in batch[0]:
             ref_tensors = [torch.tensor(s["ref_audio_array"], dtype=torch.float32) for s in batch]
@@ -243,6 +250,10 @@ def build_dataloader(
     batch_size: int,
     num_workers: int,
     drop_last: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 0,
+    worker_cpu_threads: int = 0,
+    shuffle: bool = True,
 ) -> torch.utils.data.DataLoader:
     torch_dataset = HFVoxCPMDataset(hf_dataset)
     # Standard padding-based batching; Accelerator will attach DistributedSampler if needed.
@@ -250,7 +261,10 @@ def build_dataloader(
         torch_dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=True,
+        shuffle=shuffle,
         collate_fn=HFVoxCPMDataset.collate_fn,
         drop_last=drop_last,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        worker_cpu_threads=worker_cpu_threads,
     )
