@@ -13,6 +13,10 @@ from .data import (
     HFVoxCPMDataset,
     build_dataloader,
     BatchProcessor,
+    DynamicBatchSampler,
+    BufferedDynamicBatchSampler,
+    SampleLength,
+    select_prompt_audio,
 )
 from .state import TrainingState
 from .validate import validate_manifest, ValidationResult
@@ -22,6 +26,10 @@ __all__ = [
     "TrainingTracker",
     "HFVoxCPMDataset",
     "BatchProcessor",
+    "DynamicBatchSampler",
+    "BufferedDynamicBatchSampler",
+    "SampleLength",
+    "select_prompt_audio",
     "TrainingState",
     "load_audio_text_datasets",
     "build_dataloader",

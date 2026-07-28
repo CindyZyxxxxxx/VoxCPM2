@@ -68,6 +68,9 @@ def train(
     warmup_steps: int = 1_000,
     max_steps: int = 100_000,
     max_batch_tokens: int = 0,
+    length_bucket_size: int = 0,
+    ref_audio_selection: str = "highest_ssim",
+    ref_audio_seed: int = 42,
     save_path: str = "checkpoints",
     tensorboard: str = "",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
@@ -120,6 +123,8 @@ def train(
         train_manifest=train_manifest,
         val_manifest=val_manifest,
         sample_rate=sample_rate,
+        ref_audio_selection=ref_audio_selection,
+        ref_audio_seed=ref_audio_seed,
     )
 
     def tokenize(batch):
@@ -138,34 +143,10 @@ def train(
         val_ds = val_ds.map(tokenize, batched=True, remove_columns=["text"])
 
     dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1
-    num_train_samples = len(train_ds)
+    audio_vae_fps = base_model.audio_vae.sample_rate / base_model.audio_vae.hop_length
 
-    # ------------------------------------------------------------------ #
-    # Optional: filter samples by estimated token count to avoid OOM
-    # Enabled when max_batch_tokens > 0:
-    #   max_sample_len = max_batch_tokens // batch_size
-    #   Samples exceeding this length will be dropped
-    # ------------------------------------------------------------------ #
-    if max_batch_tokens and max_batch_tokens > 0:
-        from voxcpm.training.data import compute_sample_lengths
-
-        audio_vae_fps = base_model.audio_vae.sample_rate / base_model.audio_vae.hop_length
-        est_lengths = compute_sample_lengths(
-            train_ds,
-            audio_vae_fps=audio_vae_fps,
-            patch_size=base_model.config.patch_size,
-        )
-        max_sample_len = max_batch_tokens // batch_size if batch_size > 0 else max(est_lengths)
-        keep_indices = [i for i, L in enumerate(est_lengths) if L <= max_sample_len]
-
-        if len(keep_indices) < len(train_ds) and accelerator.rank == 0:
-            tracker.print(
-                f"Filtering {len(train_ds) - len(keep_indices)} / {len(train_ds)} "
-                f"training samples longer than {max_sample_len} tokens "
-                f"(max_batch_tokens={max_batch_tokens})."
-            )
-        train_ds = train_ds.select(keep_indices)
-
+    # Dynamic batches decode and measure one bounded bucket at a time instead
+    # of scanning the full training set before the first optimizer step.
     train_loader = build_dataloader(
         train_ds,
         accelerator=accelerator,
@@ -175,6 +156,10 @@ def train(
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
         worker_cpu_threads=worker_cpu_threads,
+        max_batch_tokens=max_batch_tokens,
+        length_bucket_size=length_bucket_size,
+        audio_vae_fps=audio_vae_fps,
+        patch_size=base_model.config.patch_size,
     )
     val_loader = (
         build_dataloader(
@@ -288,21 +273,29 @@ def train(
     # Manual epoch management instead of itertools.cycle to support DistributedSampler.set_epoch()
     grad_accum_steps = max(int(grad_accum_steps), 1)
     data_epoch = 0
+    batches_in_epoch = 0
+    local_samples_since_log = 0
+    local_micro_batches_since_log = 0
     train_iter = iter(train_loader)
 
     def get_next_batch():
         """Get next batch, handles epoch boundary and DistributedSampler."""
-        nonlocal train_iter, data_epoch
+        nonlocal train_iter, data_epoch, batches_in_epoch
         try:
-            return next(train_iter)
+            batch = next(train_iter)
         except StopIteration:
             data_epoch += 1
+            batches_in_epoch = 0
             # Key: set DistributedSampler epoch to ensure different data order each epoch
-            sampler = getattr(train_loader, "sampler", None)
+            sampler = getattr(train_loader, "batch_sampler", None)
+            if not hasattr(sampler, "set_epoch"):
+                sampler = getattr(train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(data_epoch)
             train_iter = iter(train_loader)
-            return next(train_iter)
+            batch = next(train_iter)
+        batches_in_epoch += 1
+        return batch
 
     with tracker.live():
         for step in range(start_step, num_iters):
@@ -315,6 +308,8 @@ def train(
             loss_dict = {}
             for micro_step in range(grad_accum_steps):
                 batch = get_next_batch()
+                local_samples_since_log += int(batch["text_tokens"].shape[0])
+                local_micro_batches_since_log += 1
                 processed = batch_processor(batch)
 
                 # Only sync gradients on the last micro-batch
@@ -359,13 +354,31 @@ def train(
             scheduler.step()
 
             if step % log_interval == 0 or step == num_iters - 1:
+                # Aggregate only at log boundaries to avoid an all-reduce on
+                # every micro-batch. All ranks enter this branch together.
+                batch_stats = torch.tensor(
+                    [local_samples_since_log, local_micro_batches_since_log],
+                    dtype=torch.float32,
+                    device=accelerator.device,
+                )
+                accelerator.all_reduce(batch_stats, op=torch.distributed.ReduceOp.SUM)
+                avg_batch_size = batch_stats[0] / batch_stats[1].clamp_min(1.0)
+
                 loss_values = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
                 loss_values["lr"] = float(optimizer.param_groups[0]["lr"])
-                # Account for all GPUs when converting steps to epochs.
-                epoch = (step * grad_accum_steps * batch_size * accelerator.world_size) / max(1, num_train_samples)
+                # This remains accurate for variable-size batches and DDP because
+                # every rank receives the same number of batches per epoch.
+                sampler = getattr(train_loader, "batch_sampler", None)
+                if hasattr(sampler, "progress"):
+                    epoch = data_epoch + sampler.progress
+                else:
+                    epoch = data_epoch + batches_in_epoch / max(1, len(train_loader))
                 loss_values["epoch"] = float(epoch)
+                loss_values["avg_batch_size"] = float(avg_batch_size.item())
                 loss_values["grad_norm"] = float(grad_norm)
                 tracker.log_metrics(loss_values, split="train")
+                local_samples_since_log = 0
+                local_micro_batches_since_log = 0
 
             is_last_step = step == num_iters - 1
             if val_loader is not None and (step % valid_interval == 0 or is_last_step):

@@ -79,7 +79,7 @@ def validate_manifest(
         4. Audio files exist and are readable
         5. Text content is non-empty
         6. Collects duration and text length statistics
-        7. Validates optional ref_audio column
+        7. Validates optional prompt_audio_list candidates
 
     Args:
         manifest_path: Path to the JSONL manifest file.
@@ -191,18 +191,42 @@ def validate_manifest(
             result.errors.append(f"Line {i + 1}: Invalid audio path")
             has_error = True
 
-        # Validate optional ref_audio
         if "ref_audio" in entry:
-            ref_path = entry["ref_audio"]
-            if isinstance(ref_path, dict):
-                ref_path = ref_path.get("path", "")
-            if isinstance(ref_path, str) and ref_path:
-                if not os.path.isabs(ref_path):
-                    ref_path = str(manifest_dir / ref_path)
-                if os.path.isfile(ref_path):
+            result.errors.append(f"Line {i + 1}: Legacy 'ref_audio' is no longer supported; use 'prompt_audio_list'")
+            has_error = True
+
+        # Validate every candidate so all selection strategies remain usable.
+        if "prompt_audio_list" in entry:
+            candidates = entry["prompt_audio_list"]
+            if not isinstance(candidates, list):
+                result.errors.append(f"Line {i + 1}: prompt_audio_list must be a list")
+                has_error = True
+            else:
+                valid_candidate = False
+                for candidate_index, candidate in enumerate(candidates):
+                    label = f"Line {i + 1} prompt_audio_list[{candidate_index}]"
+                    if not isinstance(candidate, dict):
+                        result.errors.append(f"{label}: expected an object")
+                        has_error = True
+                        continue
+                    ref_path = candidate.get("audio")
+                    try:
+                        float(candidate["ssim"])
+                    except (KeyError, TypeError, ValueError):
+                        result.errors.append(f"{label}: missing or non-numeric 'ssim'")
+                        has_error = True
+                    if not isinstance(ref_path, str) or not ref_path:
+                        result.errors.append(f"{label}: missing or invalid 'audio' path")
+                        has_error = True
+                        continue
+                    if not os.path.isabs(ref_path):
+                        ref_path = str(manifest_dir / ref_path)
+                    if os.path.isfile(ref_path):
+                        valid_candidate = True
+                    else:
+                        result.warnings.append(f"{label}: audio file not found: {ref_path}")
+                if valid_candidate:
                     result.has_ref_audio += 1
-                else:
-                    result.warnings.append(f"Line {i + 1}: ref_audio file not found: {ref_path}")
 
         if not has_error:
             result.valid_samples += 1
