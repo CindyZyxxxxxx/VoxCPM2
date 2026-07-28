@@ -146,7 +146,8 @@ class Accelerator:
         self,
         dataset: typing.Iterable,
         *,
-        batch_size: int,
+        batch_size: int | None,
+        batch_sampler=None,
         num_workers: int = 0,
         shuffle: bool = True,
         collate_fn=None,
@@ -155,7 +156,9 @@ class Accelerator:
         prefetch_factor: int | None = None,
         worker_cpu_threads: int = 0,
     ) -> torch.utils.data.DataLoader:
-        if self.world_size > 1:
+        if batch_sampler is not None:
+            sampler = None
+        elif self.world_size > 1:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset, num_replicas=self.world_size, rank=self.rank, shuffle=shuffle
             )
@@ -164,14 +167,19 @@ class Accelerator:
             sampler = None
 
         dataloader_kwargs = {
-            "batch_size": batch_size,
-            "shuffle": shuffle if sampler is None else False,
-            "sampler": sampler,
             "num_workers": num_workers,
             "collate_fn": collate_fn,
-            "drop_last": drop_last,
             "pin_memory": True,
         }
+        if batch_sampler is not None:
+            dataloader_kwargs["batch_sampler"] = batch_sampler
+        else:
+            dataloader_kwargs.update(
+                batch_size=batch_size,
+                shuffle=shuffle if sampler is None else False,
+                sampler=sampler,
+                drop_last=drop_last,
+            )
 
         if num_workers > 0:
             dataloader_kwargs["persistent_workers"] = persistent_workers

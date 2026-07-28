@@ -161,7 +161,7 @@ class TestValidateManifest:
         result = validate_manifest(str(manifest), max_samples=10)
         assert result.total_samples == 10
 
-    def test_ref_audio_counted(self, tmp_dir):
+    def test_prompt_audio_list_counted(self, tmp_dir):
         audio = tmp_dir / "audio.wav"
         ref = tmp_dir / "ref.wav"
         _create_wav(audio)
@@ -169,7 +169,13 @@ class TestValidateManifest:
         manifest = tmp_dir / "ref.jsonl"
         _write_manifest(
             manifest,
-            [{"text": "hello", "audio": str(audio), "ref_audio": str(ref)}],
+            [
+                {
+                    "text": "hello",
+                    "audio": str(audio),
+                    "prompt_audio_list": [{"audio": str(ref), "ssim": 0.9}],
+                }
+            ],
         )
         result = validate_manifest(str(manifest))
         assert result.has_ref_audio == 1
@@ -219,8 +225,7 @@ class TestValidateManifest:
         assert not result.is_valid
         assert any("Sample rate mismatch" in e or "sample rate" in e.lower() for e in result.errors)
 
-    def test_mixed_ref_audio_warns_for_each_missing(self, tmp_dir):
-        """Missing ref_audio entries should each generate a warning independently."""
+    def test_prompt_audio_list_warns_for_each_missing_candidate(self, tmp_dir):
         audio = tmp_dir / "audio.wav"
         ref_good = tmp_dir / "ref_good.wav"
         _create_wav(audio)
@@ -230,13 +235,35 @@ class TestValidateManifest:
         _write_manifest(
             manifest,
             [
-                {"text": "row1", "audio": str(audio), "ref_audio": str(ref_good)},
-                {"text": "row2", "audio": str(audio), "ref_audio": "/nonexistent/ref.wav"},
+                {
+                    "text": "row1",
+                    "audio": str(audio),
+                    "prompt_audio_list": [{"audio": str(ref_good), "ssim": 0.8}],
+                },
+                {
+                    "text": "row2",
+                    "audio": str(audio),
+                    "prompt_audio_list": [{"audio": "/nonexistent/ref.wav", "ssim": 0.7}],
+                },
             ],
         )
         result = validate_manifest(str(manifest))
         assert result.has_ref_audio == 1
-        assert any("ref_audio file not found" in w for w in result.warnings)
+        assert any("prompt_audio_list[0]" in w and "not found" in w for w in result.warnings)
+
+    def test_legacy_ref_audio_is_rejected(self, tmp_dir):
+        audio = tmp_dir / "audio.wav"
+        _create_wav(audio)
+        manifest = tmp_dir / "legacy_ref.jsonl"
+        _write_manifest(
+            manifest,
+            [{"text": "hello", "audio": str(audio), "ref_audio": str(audio)}],
+        )
+
+        result = validate_manifest(str(manifest))
+
+        assert not result.is_valid
+        assert any("no longer supported" in error for error in result.errors)
 
     def test_cli_validate_exit_code(self, tmp_dir):
         """validate subcommand must exit 1 on validation error (missing audio)."""

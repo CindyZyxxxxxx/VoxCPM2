@@ -3,7 +3,7 @@ train_manifest: /path/to/train.jsonl
 val_manifest: null
 sample_rate: 16000        # AudioVAE encoder input rate; must match audio_vae_config.sample_rate
 out_sample_rate: 48000    # AudioVAE decoder output rate; used for TensorBoard audio logging
-batch_size: 2
+batch_size: 2            # Fixed batch size; with max_batch_tokens > 0, this is the maximum samples per batch
 grad_accum_steps: 8  # effective batch size = batch_size × grad_accum_steps = 16
 num_workers: 8
 persistent_workers: true
@@ -22,7 +22,10 @@ learning_rate: 0.0001
 weight_decay: 0.01
 warmup_steps: 100
 max_steps: 1000
-max_batch_tokens: 8192
+max_batch_tokens: 8192   # Enables dynamic batching; 0 disables it
+length_bucket_size: 200  # Bounded streaming window decoded/measured/sorted at a time; 0 selects an automatic size
+ref_audio_selection: highest_ssim  # shortest, random, or highest_ssim from prompt_audio_list
+ref_audio_seed: 42       # Deterministic per-row seed used by random selection
 max_grad_norm: 1.0        # gradient clipping max norm; 0 = disabled
 save_path: /path/to/checkpoints/finetune_lora
 tensorboard: /path/to/logs/finetune_lora
